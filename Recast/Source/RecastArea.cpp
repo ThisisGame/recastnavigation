@@ -72,16 +72,46 @@ static bool pointInPoly(int numVerts, const float* verts, const float* point)
 	return inPoly;
 }
 
+/// @par
+///
+/// 按Agent半径腐蚀可行走区域，确保Agent中心不会过于靠近墙壁或障碍物边缘。
+///
+/// 算法原理：
+///   使用两遍 Chamfer 距离变换（也叫倒角距离变换），计算每个可行走Span到最近
+///   不可行走边界的近似距离。距离值采用整数编码：正交邻居代价=2，对角邻居代价=3。
+///   因此距离值 d 对应的实际体素距离约为 d/2。
+///   最后将距离小于 erosionRadius*2 的Span标记为不可行走。
+///
+/// 为什么要腐蚀？
+///   导航网格描述的是Agent中心可到达的区域。如果Agent有一定半径(如0.6m)，
+///   那么Agent中心不能贴着墙走，否则身体会穿透墙壁。腐蚀就是把可行走区域
+///   从边界向内收缩一个Agent半径的距离，让最终的导航网格自然地远离障碍物。
+///
+/// 在构建流程中的位置：
+///   rcBuildCompactHeightfield() → 【rcErodeWalkableArea()】 → rcMarkConvexPolyArea() → 区域划分
+///
+/// @param[in]     context              构建上下文，用于记录日志和性能计时。
+/// @param[in]     erosionRadius        腐蚀半径，即Agent半径（以体素为单位）。
+///                                     该值来自 rcConfig::walkableRadius。
+/// @param[in,out] compactHeightfield   紧凑高度场。函数会将距离边界过近的Span的
+///                                     area 标记为 RC_NULL_AREA。
+/// @return 成功返回 true，内存分配失败返回 false。
 bool rcErodeWalkableArea(rcContext* context, const int erosionRadius, rcCompactHeightfield& compactHeightfield)
 {
 	rcAssert(context != NULL);
 
+	// 获取网格在X轴和Z轴上的尺寸（体素单位）
 	const int xSize = compactHeightfield.width;
 	const int zSize = compactHeightfield.height;
-	const int& zStride = xSize; // For readability
+	const int& zStride = xSize; // Z方向步长，等于X方向的宽度，用于二维索引计算
 
 	rcScopedTimer timer(context, RC_TIMER_ERODE_AREA);
 
+	// =========================================================================
+	// 第一步：分配距离场数组
+	// =========================================================================
+	// 为每个Span分配一个 unsigned char 存储到边界的距离值。
+	// 初始化为 0xff (255)，表示"距离未知/无穷远"。
 	unsigned char* distanceToBoundary = (unsigned char*)rcAlloc(sizeof(unsigned char) * compactHeightfield.spanCount,
 	                                                            RC_ALLOC_TEMP);
 	if (!distanceToBoundary)
@@ -91,7 +121,25 @@ bool rcErodeWalkableArea(rcContext* context, const int erosionRadius, rcCompactH
 	}
 	memset(distanceToBoundary, 0xff, sizeof(unsigned char) * compactHeightfield.spanCount);
 	
-	// Mark boundary cells.
+	// =========================================================================
+	// 第二步：标记边界Span（种子初始化）
+	// =========================================================================
+	// 将所有"边界"Span的距离设为 0。边界的定义：
+	//   1. 自身是不可行走的（area == RC_NULL_AREA）
+	//   2. 自身可行走，但四个正交方向中至少有一个邻居不存在连接或不可行走
+	//
+	// 这些距离为 0 的Span将作为后续距离传播的"种子点"。
+	//
+	//   种子初始化后的示意图（俯视图，B=边界(0), ?=待计算(255), ×=不可行走(0)）：
+	//
+	//     × × × × × × ×
+	//     × B B B B B ×
+	//     × B ? ? ? B ×
+	//     × B ? ? ? B ×
+	//     × B ? ? ? B ×
+	//     × B B B B B ×
+	//     × × × × × × ×
+	//
 	for (int z = 0; z < zSize; ++z)
 	{
 		for (int x = 0; x < xSize; ++x)
@@ -99,6 +147,7 @@ bool rcErodeWalkableArea(rcContext* context, const int erosionRadius, rcCompactH
 			const rcCompactCell& cell = compactHeightfield.cells[x + z * zStride];
 			for (int spanIndex = (int)cell.index, maxSpanIndex = (int)(cell.index + cell.count); spanIndex < maxSpanIndex; ++spanIndex)
 			{
+				// 不可行走的Span本身就是"障碍"，距离为 0
 				if (compactHeightfield.areas[spanIndex] == RC_NULL_AREA)
 				{
 					distanceToBoundary[spanIndex] = 0;
@@ -106,20 +155,24 @@ bool rcErodeWalkableArea(rcContext* context, const int erosionRadius, rcCompactH
 				}
 				const rcCompactSpan& span = compactHeightfield.spans[spanIndex];
 
-				// Check that there is a non-null adjacent span in each of the 4 cardinal directions.
+				// 检查四个正交方向（左、上、右、下）是否都连通且可行走。
+				// 方向编号：0=(-1,0)左  1=(0,+1)上  2=(+1,0)右  3=(0,-1)下
 				int neighborCount = 0;
 				for (int direction = 0; direction < 4; ++direction)
 				{
 					const int neighborConnection = rcGetCon(span, direction);
+					// 如果该方向没有连接（RC_NOT_CONNECTED=0x3f），说明是边界
 					if (neighborConnection == RC_NOT_CONNECTED)
 					{
 						break;
 					}
 					
+					// 计算邻居的网格坐标和Span索引
 					const int neighborX = x + rcGetDirOffsetX(direction);
 					const int neighborZ = z + rcGetDirOffsetY(direction);
 					const int neighborSpanIndex = (int)compactHeightfield.cells[neighborX + neighborZ * zStride].index + neighborConnection;
 					
+					// 如果邻居是不可行走的，也说明当前Span紧挨边界
 					if (compactHeightfield.areas[neighborSpanIndex] == RC_NULL_AREA)
 					{
 						break;
@@ -127,7 +180,7 @@ bool rcErodeWalkableArea(rcContext* context, const int erosionRadius, rcCompactH
 					neighborCount++;
 				}
 				
-				// At least one missing neighbour, so this is a boundary cell.
+				// 只要有一个方向缺少可行走的邻居，就是边界Span，距离设为 0
 				if (neighborCount != 4)
 				{
 					distanceToBoundary[spanIndex] = 0;
@@ -136,9 +189,32 @@ bool rcErodeWalkableArea(rcContext* context, const int erosionRadius, rcCompactH
 		}
 	}
 	
+	// =========================================================================
+	// 第三步：两遍 Chamfer 距离变换（传播距离值）
+	// =========================================================================
+	//
+	// Chamfer 距离变换使用3x3掩码来近似欧几里得距离。
+	// 正交方向（上下左右）代价为 2，对角方向代价为 3。
+	// 这样 d/2 就近似于实际的体素距离（对角 3/2 ≈ 1.5 ≈ √2 ≈ 1.414）。
+	//
+	// 两遍扫描的掩码分布：
+	//
+	//   Pass 1（从左上到右下扫描）：     Pass 2（从右下到左上扫描）：
+	//   检查已扫描过的邻居               检查已扫描过的邻居
+	//
+	//     +3  +2  .                         .  +2  +3
+	//     +2  cur .                         .  cur +2
+	//      .   .  .                         .   .   .
+	//
+	//   其中 +2=正交代价, +3=对角代价, .=不检查
+	//
+	// 两遍扫描覆盖全部8个方向，合起来可以正确传播距离到所有Span。
+	//
 	unsigned char newDistance;
 	
-	// Pass 1
+	// ---- Pass 1：从左上角 (0,0) 向右下角 (xSize-1, zSize-1) 扫描 ----
+	// 只检查方向 0(-1,0)左 和方向 3(0,-1)下 及它们的对角组合
+	// 即检查左、左下、下、右下 四个已扫描的邻居
 	for (int z = 0; z < zSize; ++z)
 	{
 		for (int x = 0; x < xSize; ++x)
@@ -149,25 +225,30 @@ bool rcErodeWalkableArea(rcContext* context, const int erosionRadius, rcCompactH
 			{
 				const rcCompactSpan& span = compactHeightfield.spans[spanIndex];
 
+				// 检查方向 0: (-1, 0) — 左邻居
 				if (rcGetCon(span, 0) != RC_NOT_CONNECTED)
 				{
-					// (-1,0)
-					const int aX = x + rcGetDirOffsetX(0);
-					const int aY = z + rcGetDirOffsetY(0);
+					// (-1,0) 正交邻居，代价 +2
+					const int aX = x + rcGetDirOffsetX(0);  // x - 1
+					const int aY = z + rcGetDirOffsetY(0);  // z
 					const int aIndex = (int)compactHeightfield.cells[aX + aY * xSize].index + rcGetCon(span, 0);
 					const rcCompactSpan& aSpan = compactHeightfield.spans[aIndex];
+					// 取左邻居的距离 + 2（正交代价），与当前距离取最小值
 					newDistance = (unsigned char)rcMin((int)distanceToBoundary[aIndex] + 2, 255);
 					if (newDistance < distanceToBoundary[spanIndex])
 					{
 						distanceToBoundary[spanIndex] = newDistance;
 					}
 
-					// (-1,-1)
+					// (-1,-1) 左下对角邻居，代价 +3
+					// 通过左邻居 aSpan 的方向 3(0,-1) 间接访问对角格子
+					// 即先走到 (x-1, z)，再从那里走到 (x-1, z-1)
 					if (rcGetCon(aSpan, 3) != RC_NOT_CONNECTED)
 					{
-						const int bX = aX + rcGetDirOffsetX(3);
-						const int bY = aY + rcGetDirOffsetY(3);
+						const int bX = aX + rcGetDirOffsetX(3);  // x - 1
+						const int bY = aY + rcGetDirOffsetY(3);  // z - 1
 						const int bIndex = (int)compactHeightfield.cells[bX + bY * xSize].index + rcGetCon(aSpan, 3);
+						// 取对角邻居的距离 + 3（对角代价），与当前距离取最小值
 						newDistance = (unsigned char)rcMin((int)distanceToBoundary[bIndex] + 3, 255);
 						if (newDistance < distanceToBoundary[spanIndex])
 						{
@@ -175,11 +256,12 @@ bool rcErodeWalkableArea(rcContext* context, const int erosionRadius, rcCompactH
 						}
 					}
 				}
+				// 检查方向 3: (0, -1) — 下邻居
 				if (rcGetCon(span, 3) != RC_NOT_CONNECTED)
 				{
-					// (0,-1)
-					const int aX = x + rcGetDirOffsetX(3);
-					const int aY = z + rcGetDirOffsetY(3);
+					// (0,-1) 正交邻居，代价 +2
+					const int aX = x + rcGetDirOffsetX(3);  // x
+					const int aY = z + rcGetDirOffsetY(3);  // z - 1
 					const int aIndex = (int)compactHeightfield.cells[aX + aY * xSize].index + rcGetCon(span, 3);
 					const rcCompactSpan& aSpan = compactHeightfield.spans[aIndex];
 					newDistance = (unsigned char)rcMin((int)distanceToBoundary[aIndex] + 2, 255);
@@ -188,11 +270,13 @@ bool rcErodeWalkableArea(rcContext* context, const int erosionRadius, rcCompactH
 						distanceToBoundary[spanIndex] = newDistance;
 					}
 
-					// (1,-1)
+					// (1,-1) 右下对角邻居，代价 +3
+					// 通过下邻居 aSpan 的方向 2(+1,0) 间接访问对角格子
+					// 即先走到 (x, z-1)，再从那里走到 (x+1, z-1)
 					if (rcGetCon(aSpan, 2) != RC_NOT_CONNECTED)
 					{
-						const int bX = aX + rcGetDirOffsetX(2);
-						const int bY = aY + rcGetDirOffsetY(2);
+						const int bX = aX + rcGetDirOffsetX(2);  // x + 1
+						const int bY = aY + rcGetDirOffsetY(2);  // z - 1
 						const int bIndex = (int)compactHeightfield.cells[bX + bY * xSize].index + rcGetCon(aSpan, 2);
 						newDistance = (unsigned char)rcMin((int)distanceToBoundary[bIndex] + 3, 255);
 						if (newDistance < distanceToBoundary[spanIndex])
@@ -205,7 +289,9 @@ bool rcErodeWalkableArea(rcContext* context, const int erosionRadius, rcCompactH
 		}
 	}
 
-	// Pass 2
+	// ---- Pass 2：从右下角 (xSize-1, zSize-1) 向左上角 (0,0) 扫描 ----
+	// 只检查方向 2(+1,0)右 和方向 1(0,+1)上 及它们的对角组合
+	// 即检查右、右上、上、左上 四个已扫描的邻居
 	for (int z = zSize - 1; z >= 0; --z)
 	{
 		for (int x = xSize - 1; x >= 0; --x)
@@ -216,11 +302,12 @@ bool rcErodeWalkableArea(rcContext* context, const int erosionRadius, rcCompactH
 			{
 				const rcCompactSpan& span = compactHeightfield.spans[spanIndex];
 
+				// 检查方向 2: (+1, 0) — 右邻居
 				if (rcGetCon(span, 2) != RC_NOT_CONNECTED)
 				{
-					// (1,0)
-					const int aX = x + rcGetDirOffsetX(2);
-					const int aY = z + rcGetDirOffsetY(2);
+					// (1,0) 正交邻居，代价 +2
+					const int aX = x + rcGetDirOffsetX(2);  // x + 1
+					const int aY = z + rcGetDirOffsetY(2);  // z
 					const int aIndex = (int)compactHeightfield.cells[aX + aY * xSize].index + rcGetCon(span, 2);
 					const rcCompactSpan& aSpan = compactHeightfield.spans[aIndex];
 					newDistance = (unsigned char)rcMin((int)distanceToBoundary[aIndex] + 2, 255);
@@ -229,11 +316,13 @@ bool rcErodeWalkableArea(rcContext* context, const int erosionRadius, rcCompactH
 						distanceToBoundary[spanIndex] = newDistance;
 					}
 
-					// (1,1)
+					// (1,1) 右上对角邻居，代价 +3
+					// 通过右邻居 aSpan 的方向 1(0,+1) 间接访问对角格子
+					// 即先走到 (x+1, z)，再从那里走到 (x+1, z+1)
 					if (rcGetCon(aSpan, 1) != RC_NOT_CONNECTED)
 					{
-						const int bX = aX + rcGetDirOffsetX(1);
-						const int bY = aY + rcGetDirOffsetY(1);
+						const int bX = aX + rcGetDirOffsetX(1);  // x + 1
+						const int bY = aY + rcGetDirOffsetY(1);  // z + 1
 						const int bIndex = (int)compactHeightfield.cells[bX + bY * xSize].index + rcGetCon(aSpan, 1);
 						newDistance = (unsigned char)rcMin((int)distanceToBoundary[bIndex] + 3, 255);
 						if (newDistance < distanceToBoundary[spanIndex])
@@ -242,11 +331,12 @@ bool rcErodeWalkableArea(rcContext* context, const int erosionRadius, rcCompactH
 						}
 					}
 				}
+				// 检查方向 1: (0, +1) — 上邻居
 				if (rcGetCon(span, 1) != RC_NOT_CONNECTED)
 				{
-					// (0,1)
-					const int aX = x + rcGetDirOffsetX(1);
-					const int aY = z + rcGetDirOffsetY(1);
+					// (0,1) 正交邻居，代价 +2
+					const int aX = x + rcGetDirOffsetX(1);  // x
+					const int aY = z + rcGetDirOffsetY(1);  // z + 1
 					const int aIndex = (int)compactHeightfield.cells[aX + aY * xSize].index + rcGetCon(span, 1);
 					const rcCompactSpan& aSpan = compactHeightfield.spans[aIndex];
 					newDistance = (unsigned char)rcMin((int)distanceToBoundary[aIndex] + 2, 255);
@@ -255,11 +345,13 @@ bool rcErodeWalkableArea(rcContext* context, const int erosionRadius, rcCompactH
 						distanceToBoundary[spanIndex] = newDistance;
 					}
 
-					// (-1,1)
+					// (-1,1) 左上对角邻居，代价 +3
+					// 通过上邻居 aSpan 的方向 0(-1,0) 间接访问对角格子
+					// 即先走到 (x, z+1)，再从那里走到 (x-1, z+1)
 					if (rcGetCon(aSpan, 0) != RC_NOT_CONNECTED)
 					{
-						const int bX = aX + rcGetDirOffsetX(0);
-						const int bY = aY + rcGetDirOffsetY(0);
+						const int bX = aX + rcGetDirOffsetX(0);  // x - 1
+						const int bY = aY + rcGetDirOffsetY(0);  // z + 1
 						const int bIndex = (int)compactHeightfield.cells[bX + bY * xSize].index + rcGetCon(aSpan, 0);
 						newDistance = (unsigned char)rcMin((int)distanceToBoundary[bIndex] + 3, 255);
 						if (newDistance < distanceToBoundary[spanIndex])
@@ -272,6 +364,13 @@ bool rcErodeWalkableArea(rcContext* context, const int erosionRadius, rcCompactH
 		}
 	}
 
+	// =========================================================================
+	// 第四步：根据距离场执行腐蚀
+	// =========================================================================
+	// 将距离值小于阈值的Span标记为不可行走。
+	// 阈值 = erosionRadius * 2，因为距离编码中正交代价为 2（即1个体素=距离2）。
+	// 例如：erosionRadius=3 → minBoundaryDistance=6
+	//       某Span的距离=4（约2个体素远）< 6 → 标记为不可行走
 	const unsigned char minBoundaryDistance = (unsigned char)(erosionRadius * 2);
 	for (int spanIndex = 0; spanIndex < compactHeightfield.spanCount; ++spanIndex)
 	{

@@ -134,36 +134,99 @@ void duDebugDrawTriMeshSlope(duDebugDraw* dd, const float* verts, int /*nverts*/
 	dd->texture(false);
 }
 
+/// @brief 以实心盒子的方式绘制高度场（rcHeightfield）中的所有体素 Span。
+///
+/// 该函数遍历高度场中每个 (x, z) 网格列的所有 Span，并将每个 Span 渲染为一个
+/// 三维立方体盒子。盒子的 XZ 大小为一个体素格子（cs × cs），Y 方向范围为
+/// [smin*ch, smax*ch]（相对于高度场原点 bmin）。
+///
+/// 所有 Span 使用统一的白色着色，不区分可行走/不可行走区域。
+/// 这是最基础的体素可视化模式，主要用于查看光栅化（体素化）后生成的原始高度场数据。
+///
+/// 与 duDebugDrawHeightfieldWalkable 的区别：
+///   - 本函数：所有 Span 统一白色，不考虑 area 标记。
+///   - Walkable 版本：根据 Span 的 area 值着不同颜色（可行走/不可行走/自定义区域）。
+///
+/// 数据来源：只需完成 Step 2（光栅化）即可调用本函数，无需后续过滤或紧凑化步骤。
+///
+/// @param[in] dd  调试绘制接口指针，用于提交顶点和绘制命令。如果为 NULL 则直接返回。
+/// @param[in] hf  要绘制的高度场，包含体素网格数据。
 void duDebugDrawHeightfieldSolid(duDebugDraw* dd, const rcHeightfield& hf)
 {
+	// 空指针检查：如果没有有效的绘制接口，直接返回
 	if (!dd) return;
 
+	// 获取高度场的世界坐标原点（AABB 最小角），用于将体素坐标转换为世界坐标
+	// orig[0] = X 轴起始位置，orig[1] = Y 轴起始位置（最低高度），orig[2] = Z 轴起始位置
 	const float* orig = hf.bmin;
+
+	// cs (cell size)：XZ 平面上每个体素格子的边长（水平分辨率），单位：世界坐标
 	const float cs = hf.cs;
+
+	// ch (cell height)：Y 轴方向每个体素的高度（垂直分辨率），单位：世界坐标
+	// Span 的 smin/smax 是以 ch 为单位的整数值，乘以 ch 得到实际世界高度
 	const float ch = hf.ch;
 	
+	// w：高度场在 X 轴方向的网格列数（体素数量）
 	const int w = hf.width;
+
+	// h：高度场在 Z 轴方向的网格行数（体素数量）
+	// 注意：这里的 h 是 XZ 平面的 Z 方向大小，不是 Y 轴高度
 	const int h = hf.height;
 		
+	// 定义立方体六个面的颜色数组
+	// 索引含义：[0]=顶面, [1]=底面, [2]=正面, [3]=背面, [4]=右面, [5]=左面
+	// duCalcBoxColors 会根据输入的顶面颜色和侧面颜色，为每个面计算出带有明暗差异的颜色
+	// （通过 duMultCol 乘以不同的亮度系数：顶面250, 底面140, 各侧面165/217）
+	// 这里顶面和侧面都传入白色(255,255,255,255)，最终效果是白色基调带有光照明暗感
 	unsigned int fcol[6];
 	duCalcBoxColors(fcol, duRGBA(255,255,255,255), duRGBA(255,255,255,255));
 	
+	// 开始提交四边形（QUADS）绘制批次
+	// duAppendBox 内部会为每个面提交 4 个顶点，每个面是一个四边形
+	// 一个立方体 = 6 个面 = 24 个顶点
 	dd->begin(DU_DRAW_QUADS);
 	
+	// 遍历高度场的每一个 (x, z) 网格列
+	// y 对应 Z 轴方向的索引（Recast 中 y 变量名对应世界 Z 轴）
 	for (int y = 0; y < h; ++y)
 	{
+		// x 对应 X 轴方向的索引
 		for (int x = 0; x < w; ++x)
 		{
+			// 将体素网格索引 (x, y) 转换为世界坐标中的 XZ 位置
+			// fx：当前格子左下角的世界 X 坐标
 			float fx = orig[0] + x*cs;
+
+			// fz：当前格子左下角的世界 Z 坐标
 			float fz = orig[2] + y*cs;
+
+			// 获取当前 (x, z) 列的 Span 链表头指针x|{"pl:okk jazsaa  ｝｛｝
+			// spans 数组的索引方式为 x + z * width（行优先存储）
+			// 链表中 Span 按 smin 从小到大排列（从低到高）
 			const rcSpan* s = hf.spans[x + y*w];
+
+			// 遍历当前列中的所有 Span（沿 Y 轴从低到高）
 			while (s)
 			{
+				// 为当前 Span 绘制一个实心立方体盒子
+				// 盒子参数（世界坐标）：
+				//   最小角：(fx,                    orig[1] + smin*ch, fz     )
+				//   最大角：(fx + cs,               orig[1] + smax*ch, fz + cs)
+				// 其中：
+				//   - fx ~ fx+cs：X 方向跨一个格子宽度
+				//   - orig[1]+smin*ch ~ orig[1]+smax*ch：Y 方向从 Span 底部到顶部
+				//   - fz ~ fz+cs：Z 方向跨一个格子宽度
+				// fcol 为六个面的颜色数组，实现简单的明暗效果
 				duAppendBox(dd, fx, orig[1]+s->smin*ch, fz, fx+cs, orig[1] + s->smax*ch, fz+cs, fcol);
+
+				// 移动到同一列中下一个更高位置的 Span
 				s = s->next;
 			}
 		}
 	}
+
+	// 结束绘制批次，将积累的所有四边形顶点提交给 GPU 渲染
 	dd->end();
 }
 

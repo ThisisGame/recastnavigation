@@ -212,123 +212,361 @@ private:
 };
 
 /// Specifies a configuration to use when performing Recast builds.
+/// 指定执行 Recast 构建时使用的配置参数。
+///
+/// 该结构体包含导航网格构建流程中所有关键参数，分为以下几类：
+///   - 网格尺寸参数：width, height, tileSize, borderSize
+///   - 体素化参数：cs(XZ平面体素尺寸), ch(Y轴体素高度)
+///   - 空间范围：bmin, bmax（构建区域的轴对齐包围盒）
+///   - Agent参数：walkableSlopeAngle, walkableHeight, walkableClimb, walkableRadius
+///   - 轮廓与多边形参数：maxEdgeLen, maxSimplificationError, maxVertsPerPoly
+///   - 区域划分参数：minRegionArea, mergeRegionArea
+///   - 细节网格参数：detailSampleDist, detailSampleMaxError
+///
+/// 单位说明：
+///   - [vx] = 体素单位 (voxel units)，即以体素格子为计量的整数单位
+///   - [wu] = 世界单位 (world units)，即场景中的浮点坐标单位
+///
 /// @ingroup recast
 struct rcConfig
 {
 	/// The width of the field along the x-axis. [Limit: >= 0] [Units: vx]
+	/// 高度场沿X轴的宽度（体素数）。
+	/// 由 rcCalcGridSize() 根据包围盒和 cs 自动计算：width = ceil((bmax[0] - bmin[0]) / cs)
 	int width;
 
 	/// The height of the field along the z-axis. [Limit: >= 0] [Units: vx]
+	/// 高度场沿Z轴的高度（体素数）。注意这里的"height"指XZ平面的Z方向格子数，不是Y轴。
+	/// 由 rcCalcGridSize() 根据包围盒和 cs 自动计算：height = ceil((bmax[2] - bmin[2]) / cs)
 	int height;
 	
 	/// The width/height size of tile's on the xz-plane. [Limit: >= 0] [Units: vx]
+	/// 分块(Tile)模式下，每个Tile在XZ平面上的尺寸（体素数）。
+	/// 仅在分块构建（如 TileMesh）时使用。若为0，表示不分块（Solo模式）。
+	/// 典型值如 64、128 等。Tile越大构建越慢，但导航精度更高。
 	int tileSize;
 	
 	/// The size of the non-navigable border around the heightfield. [Limit: >=0] [Units: vx]
+	/// 高度场周围不可导航的边界大小（体素数）。
+	/// 在分块模式下用于保证相邻Tile之间的无缝拼接，通常设为 walkableRadius 的值。
+	/// Solo模式下通常为 0。
 	int borderSize;
 
 	/// The xz-plane cell size to use for fields. [Limit: > 0] [Units: wu] 
+	/// XZ平面上每个体素格子的边长（世界单位）。
+	/// 这是体素化的基础分辨率参数，值越小精度越高但内存和计算开销越大。
+	/// 典型值：0.1 ~ 1.0，取决于场景规模。
+	/// Agent半径通常应为 cs 的 2~4 倍，以保证合理的网格质量。
 	float cs;
 
 	/// The y-axis cell size to use for fields. [Limit: > 0] [Units: wu]
+	/// Y轴方向（竖直方向）每个体素的高度（世界单位）。
+	/// 影响高度场在垂直方向的分辨率。通常设为 cs 的一半（如 cs=0.3, ch=0.2）。
+	/// 值越小，垂直方向的细节越精确（如台阶、斜坡的识别），但内存开销增大。
 	float ch;
 
 	/// The minimum bounds of the field's AABB. [(x, y, z)] [Units: wu]
+	/// 构建区域轴对齐包围盒(AABB)的最小角坐标 (x, y, z)，世界单位。
+	/// 定义了导航网格的构建范围下界。通常取自输入几何体的包围盒。
 	float bmin[3]; 
 
 	/// The maximum bounds of the field's AABB. [(x, y, z)] [Units: wu]
+	/// 构建区域轴对齐包围盒(AABB)的最大角坐标 (x, y, z)，世界单位。
+	/// 定义了导航网格的构建范围上界。通常取自输入几何体的包围盒。
 	float bmax[3];
 
 	/// The maximum slope that is considered walkable. [Limits: 0 <= value < 90] [Units: Degrees] 
+	/// 可行走的最大坡度角（度数）。
+	/// 在体素化阶段(Step 2)，通过 rcMarkWalkableTriangles() 判断每个三角形的法线与Y轴的夹角，
+	/// 若夹角 <= walkableSlopeAngle，则标记该三角形为可行走(RC_WALKABLE_AREA)。
+	/// 典型值：45 度。设为 0 则只有完全水平的面才可行走。
 	float walkableSlopeAngle;
 
 	/// Minimum floor to 'ceiling' height that will still allow the floor area to 
 	/// be considered walkable. [Limit: >= 3] [Units: vx] 
+	/// Agent的最小通行高度（体素数），即"地板到天花板"的最小净空。
+	/// 若一个Span上方的净空高度小于此值，该Span将被标记为不可行走。
+	/// 由 Agent身高(世界单位) 通过 ceilf(agentHeight / ch) 向上取整得到。
+	/// 向上取整是为了保守估计，确保Agent能站得下。最小值为3。
 	int walkableHeight;
 	
 	/// Maximum ledge height that is considered to still be traversable. [Limit: >=0] [Units: vx] 
+	/// Agent可攀爬的最大台阶高度（体素数）。
+	/// 在过滤阶段(Step 3)用于判断相邻Span之间的高度差是否可以跨越。
+	/// 由 Agent最大攀爬高度(世界单位) 通过 floorf(agentMaxClimb / ch) 向下取整得到。
+	/// 向下取整是为了保守估计，避免Agent攀爬过高的台阶。
+	/// 此值也用于光栅化时相邻Span的合并判断。
 	int walkableClimb;
 	
 	/// The distance to erode/shrink the walkable area of the heightfield away from 
 	/// obstructions.  [Limit: >=0] [Units: vx] 
+	/// Agent的半径（体素数），用于腐蚀(收缩)可行走区域。
+	/// 在 Step 4 中，rcErodeWalkableArea() 会从所有不可行走区域的边界向内收缩此距离，
+	/// 确保Agent中心点不会过于靠近墙壁或障碍物边缘。
+	/// 由 Agent半径(世界单位) 通过 ceilf(agentRadius / cs) 向上取整得到。
 	int walkableRadius;
 	
 	/// The maximum allowed length for contour edges along the border of the mesh. [Limit: >=0] [Units: vx] 
+	/// 轮廓边的最大允许长度（体素数）。
+	/// 在 Step 5 轮廓构建阶段，超过此长度的边会被细分为更短的线段，
+	/// 以防止沿墙壁产生过长的直线轮廓边。值为 0 表示不限制。
+	/// 由 edgeMaxLen(世界单位) / cs 转换得到。
 	int maxEdgeLen;
 	
 	/// The maximum distance a simplified contour's border edges should deviate 
 	/// the original raw contour. [Limit: >=0] [Units: vx]
+	/// 轮廓简化的最大允许偏差（世界单位）。
+	/// 在 Step 5 中，使用 Douglas-Peucker 算法简化轮廓时，简化后的边与原始边之间的
+	/// 最大距离不超过此值。值越大简化越多（多边形越少但精度降低），值越小保留越多细节。
+	/// 典型值：1.0 ~ 1.8。设为 0 则不简化。
 	float maxSimplificationError;
 	
 	/// The minimum number of cells allowed to form isolated island areas. [Limit: >=0] [Units: vx] 
+	/// 允许形成独立区域的最小面积（体素²）。
+	/// 在 Step 4 区域划分时，面积小于此值的孤立区域将被移除。
+	/// 用于清除由噪声或微小几何体产生的碎片区域。
+	/// 注意：此值是面积，由 rcSqr(regionMinSize) 计算得到（即边长的平方）。
 	int minRegionArea;
 	
 	/// Any regions with a span count smaller than this value will, if possible, 
 	/// be merged with larger regions. [Limit: >=0] [Units: vx] 
+	/// 区域合并面积阈值（体素²）。
+	/// 面积小于此值的区域会尽可能被合并到相邻的更大区域中。
+	/// 用于减少最终多边形数量，避免过多碎小多边形。
+	/// 注意：此值是面积，由 rcSqr(regionMergeSize) 计算得到（即边长的平方）。
 	int mergeRegionArea;
 	
 	/// The maximum number of vertices allowed for polygons generated during the 
 	/// contour to polygon conversion process. [Limit: >= 3] 
+	/// 轮廓转多边形时，每个多边形允许的最大顶点数。
+	/// 在 Step 6 中，轮廓被三角化后，相邻三角形会合并为凸多边形，
+	/// 合并后的多边形顶点数不超过此值。
+	/// Detour 运行时要求此值 <= DT_VERTS_PER_POLYGON(默认为6)。
+	/// 值越大，多边形越少（寻路效率越高），但多边形形状越复杂。
+	/// 典型值：6。最小值：3（即纯三角形网格）。
 	int maxVertsPerPoly;
 	
 	/// Sets the sampling distance to use when generating the detail mesh.
 	/// (For height detail only.) [Limits: 0 or >= 0.9] [Units: wu] 
+	/// 生成细节网格(Detail Mesh)时的采样间距（世界单位）。
+	/// 在 Step 7 中，对每个多边形内部按此间距均匀采样高度点，
+	/// 用于为平面多边形添加高度细节信息。
+	/// 设为 0 表示禁用细节采样（多边形保持平面）。
+	/// 值越小采样点越密、高度还原越精确，但计算开销越大。
+	/// 实际使用时先判断：若 detailSampleDist < 0.9 则视为禁用。
+	/// 典型设置：cellSize * 6（如 cs=0.3 时约 1.8）。
 	float detailSampleDist;
 	
 	/// The maximum distance the detail mesh surface should deviate from heightfield
 	/// data. (For height detail only.) [Limit: >=0] [Units: wu] 
+	/// 细节网格表面与高度场数据之间允许的最大高度偏差（世界单位）。
+	/// 在 Step 7 中，若某采样点处多边形表面与实际高度场的高度差超过此值，
+	/// 则在该位置插入额外顶点以提升高度精度。
+	/// 值越小，细节网格越贴合原始地形，但顶点和三角形数量越多。
+	/// 典型设置：cellHeight * 1（如 ch=0.2 时为 0.2）。
 	float detailSampleMaxError;
 };
 
-/// Defines the number of bits allocated to rcSpan::smin and rcSpan::smax.
+/// @brief 定义 rcSpan::smin 和 rcSpan::smax 位域所占的位数。
+/// 使用 13 位可以表示 0 ~ 8191 的高度值范围，以体素单位(vx)计量。
+/// 结合 ch(每个体素的世界高度)，最大可表示高度 = 8191 * ch。
 static const int RC_SPAN_HEIGHT_BITS = 13;
-/// Defines the maximum value for rcSpan::smin and rcSpan::smax.
+
+/// @brief 定义 rcSpan::smin 和 rcSpan::smax 的最大允许值。
+/// 值为 (1 << 13) - 1 = 8191，即 13 位无符号整数能表示的最大值。
 static const int RC_SPAN_MAX_HEIGHT = (1 << RC_SPAN_HEIGHT_BITS) - 1;
 
-/// The number of spans allocated per span spool.
+/// @brief 每个 rcSpanPool 中预分配的 rcSpan 数量。
+/// 使用内存池分配策略，一次性分配 2048 个 Span，减少频繁的堆内存分配开销。
+/// 当高度场中的 Span 数量超过当前所有池的容量时，会自动创建新的 rcSpanPool。
 /// @see rcSpanPool
 static const int RC_SPANS_PER_POOL = 2048;
 
-/// Represents a span in a heightfield.
+/// @brief 表示高度场中一个体素列内的一段实体跨度(Span)。
+///
+/// Span 是 Recast 体素化的基本单元。在高度场的每个 (x, z) 网格列中，
+/// 可能存在多个沿 Y 轴排列的 Span，形成一个单链表结构。
+/// 每个 Span 记录了一段被几何体占据的实体空间的高度范围 [smin, smax]。
+///
+/// 内存布局（位域）：
+///   - smin (13 bits) + smax (13 bits) + area (6 bits) = 32 bits (一个 unsigned int)
+///   - 再加上一个 next 指针（4/8 字节），整个结构体在 32 位系统上为 8 字节，
+///     64 位系统上为 16 字节（含对齐填充）。
+///
+/// 示意图（一个网格列中的 Span 链表，从低到高排列）：
+///   Y轴(高度)
+///    ^  ┌──────┐
+///    |  │Span C│ smin=50, smax=60 (最上层的实体)  → next = NULL
+///    |  └──────┘
+///    |  （开放空间: 40~50 之间为可通行区域）
+///    |  ┌──────┐
+///    |  │Span B│ smin=30, smax=40 (中间层的实体)  → next = Span C
+///    |  └──────┘
+///    |  （开放空间: 20~30 之间为可通行区域）
+///    |  ┌──────┐
+///    |  │Span A│ smin=0,  smax=20 (地面实体)      → next = Span B
+///    |  └──────┘
+///    +--→ XZ平面
+///
 /// @see rcHeightfield
 struct rcSpan
 {
-	unsigned int smin : RC_SPAN_HEIGHT_BITS; ///< The lower limit of the span. [Limit: < #smax]
-	unsigned int smax : RC_SPAN_HEIGHT_BITS; ///< The upper limit of the span. [Limit: <= #RC_SPAN_MAX_HEIGHT]
-	unsigned int area : 6;                   ///< The area id assigned to the span.
-	rcSpan* next;                            ///< The next span higher up in column.
+	/// Span 底部高度（体素单位），即实体空间的下限。
+	/// 使用位域存储，占 RC_SPAN_HEIGHT_BITS (13) 位，范围 [0, 8191]。
+	/// [约束: smin < smax]
+	unsigned int smin : RC_SPAN_HEIGHT_BITS;
+
+	/// Span 顶部高度（体素单位），即实体空间的上限。
+	/// 使用位域存储，占 RC_SPAN_HEIGHT_BITS (13) 位，范围 [0, 8191]。
+	/// Span 的顶部(smax)到上方下一个 Span 的底部(next->smin)之间的空间，
+	/// 就是开放空间（open space），用于判断是否可行走。
+	/// [约束: smin < smax <= RC_SPAN_MAX_HEIGHT]
+	unsigned int smax : RC_SPAN_HEIGHT_BITS;
+
+	/// 该 Span 的区域 ID，用于标识地表类型。
+	/// 使用 6 位存储，范围 [0, 63]。
+	/// 常见取值：
+	///   - RC_NULL_AREA (0)：不可行走区域
+	///   - RC_WALKABLE_AREA (63)：可行走区域（默认标记值）
+	///   - 1~62：用户自定义区域（如草地、道路、水域等）
+	unsigned int area : 6;
+
+	/// 指向同一列中下一个更高位置的 Span 的指针，形成单链表。
+	/// 链表按 smin 从小到大排列（从低到高）。
+	/// 若为 NULL，表示当前 Span 是该列中最高的 Span。
+	rcSpan* next;
 };
 
-/// A memory pool used for quick allocation of spans within a heightfield.
-/// @see rcHeightfield
+/// @brief 用于在高度场中快速分配 rcSpan 实例的内存池。
+///
+/// 为了避免在体素化过程中频繁进行堆内存分配（每次 new/malloc 一个 rcSpan），
+/// Recast 采用了池化分配策略：每次需要新 Span 时从预分配的池中取出，
+/// 释放时归还到空闲链表(freelist)而非释放内存。
+///
+/// 多个 rcSpanPool 通过 next 指针串成链表，挂在 rcHeightfield::pools 上。
+/// 当所有现有池的 Span 都被用完时，会动态分配一个新的 rcSpanPool。
+///
+/// 内存池链表结构示意图：
+///   rcHeightfield::pools → [Pool 3] → [Pool 2] → [Pool 1] → NULL
+///                            ↑ 最新分配的池在链表头部
+///
+/// @see rcHeightfield, rcSpan, RC_SPANS_PER_POOL
 struct rcSpanPool
 {
-	rcSpanPool* next;					///< The next span pool.
-	rcSpan items[RC_SPANS_PER_POOL];	///< Array of spans in the pool.
+	/// 指向下一个 Span 池的指针，形成单向链表。
+	/// 新分配的池插入到链表头部（rcHeightfield::pools 始终指向最新的池）。
+	rcSpanPool* next;
+
+	/// 预分配的 Span 数组，每个池包含 RC_SPANS_PER_POOL (2048) 个 Span。
+	/// 初始时所有 Span 通过 rcSpan::next 串成空闲链表，
+	/// 使用时从 rcHeightfield::freelist 头部取出。
+	rcSpan items[RC_SPANS_PER_POOL];
 };
 
-/// A dynamic heightfield representing obstructed space.
+/// @brief 动态高度场，表示被几何体占据的实体空间。
+///
+/// rcHeightfield 是 Recast 导航网格构建流程中体素化阶段（Step 2）的核心数据结构。
+/// 它将 3D 场景在 XZ 平面上划分为 width × height 的二维网格，
+/// 每个网格列 (x, z) 中存储一个 rcSpan 链表，记录沿 Y 轴被几何体占据的实体跨度。
+///
+/// 数据结构示意图（俯视 XZ 平面，每个格子对应一个 Span 链表）：
+///
+///   Z轴 ↑
+///        ┌───┬───┬───┬───┐
+///    h-1 │   │   │   │   │  ← 每个格子 = spans[x + z * width]
+///        ├───┼───┼───┼───┤     指向该列的 Span 链表头
+///    ... │   │   │   │   │
+///        ├───┼───┼───┼───┤
+///      1 │   │   │   │   │
+///        ├───┼───┼───┼───┤
+///      0 │   │   │   │   │
+///        └───┴───┴───┴───┘
+///          0   1  ...  w-1  → X轴
+///
+///   每个格子的边长 = cs（XZ平面体素尺寸）
+///   每个 Span 的高度量化单位 = ch（Y轴体素高度）
+///
+/// 典型使用流程：
+///   1. rcAllocHeightfield() — 分配 rcHeightfield 对象
+///   2. rcCreateHeightfield() — 初始化网格尺寸、包围盒、分配 spans 数组
+///   3. rcRasterizeTriangles() — 将三角形光栅化为 Span 填入高度场
+///   4. rcFilter*() — 过滤不可行走的 Span
+///   5. rcBuildCompactHeightfield() — 转换为紧凑高度场继续后续处理
+///   6. rcFreeHeightField() — 释放高度场
+///
+/// 内存管理：
+///   Span 的分配采用内存池策略（pools + freelist），避免频繁的堆分配。
+///   使用 rcAllocHeightfield() 创建，rcFreeHeightField() 销毁。
+///   禁止拷贝（拷贝构造和赋值运算符被禁用）。
+///
 /// @ingroup recast
+/// @see rcSpan, rcSpanPool, rcAllocHeightfield, rcFreeHeightField, rcCreateHeightfield
 struct rcHeightfield
 {
+	/// 默认构造函数。将所有成员值初始化为零/空。
+	/// 构造后需要调用 rcCreateHeightfield() 完成实际初始化（分配 spans 数组等）。
 	rcHeightfield();
+
+	/// 析构函数。释放所有已分配的内存：
+	///   - 释放 spans 指针数组（rcFree）
+	///   - 遍历并释放所有 rcSpanPool 内存池节点（rcFree）
 	~rcHeightfield();
 
-	int width;			///< The width of the heightfield. (Along the x-axis in cell units.)
-	int height;			///< The height of the heightfield. (Along the z-axis in cell units.)
-	float bmin[3];  	///< The minimum bounds in world space. [(x, y, z)]
-	float bmax[3];		///< The maximum bounds in world space. [(x, y, z)]
-	float cs;			///< The size of each cell. (On the xz-plane.)
-	float ch;			///< The height of each cell. (The minimum increment along the y-axis.)
-	rcSpan** spans;		///< Heightfield of spans (width*height).
+	/// 高度场在 X 轴方向的网格宽度（体素数）。
+	/// 由 rcCreateHeightfield() 设置，值来源于 rcCalcGridSize() 的计算结果。
+	/// 计算公式：width = (int)((bmax[0] - bmin[0]) / cs + 0.5f)
+	int width;
 
-	// memory pool for rcSpan instances.
-	rcSpanPool* pools;	///< Linked list of span pools.
-	rcSpan* freelist;	///< The next free span.
+	/// 高度场在 Z 轴方向的网格高度（体素数）。
+	/// 注意：这里 "height" 指的是 XZ 平面上 Z 方向的格子数，而非 Y 轴的高度。
+	/// 由 rcCreateHeightfield() 设置。
+	/// 计算公式：height = (int)((bmax[2] - bmin[2]) / cs + 0.5f)
+	int height;
+
+	/// 高度场轴对齐包围盒 (AABB) 的最小角坐标 (x, y, z)，世界单位。
+	/// 定义了高度场覆盖区域的下界。
+	/// 世界坐标到体素坐标的转换：voxelX = (worldX - bmin[0]) / cs
+	float bmin[3];
+
+	/// 高度场轴对齐包围盒 (AABB) 的最大角坐标 (x, y, z)，世界单位。
+	/// 定义了高度场覆盖区域的上界。
+	float bmax[3];
+
+	/// XZ 平面上每个体素格子的边长（世界单位）。
+	/// 这是水平方向的分辨率参数。值越小，网格越精细，但 width * height 越大。
+	/// 用于世界坐标与体素坐标之间的转换。
+	float cs;
+
+	/// Y 轴方向每个体素的高度（世界单位）。
+	/// 这是垂直方向的分辨率参数。Span 的 smin/smax 以此为量化单位。
+	/// 世界高度到体素高度的转换：voxelY = (worldY - bmin[1]) / ch
+	float ch;
+
+	/// Span 链表指针数组，大小为 width * height。
+	/// 索引方式：spans[x + z * width] 获取 (x, z) 位置的 Span 链表头指针。
+	/// 如果某个位置没有任何几何体占据，则对应指针为 NULL。
+	/// 每个链表中的 Span 按 smin 从小到大（从低到高）排列。
+	/// 该数组由 rcCreateHeightfield() 分配（大小为 width * height 个指针）。
+	rcSpan** spans;
+
+	// ---- 以下为 rcSpan 实例的内存池管理 ----
+
+	/// Span 内存池链表的头指针。
+	/// 每个 rcSpanPool 节点包含 RC_SPANS_PER_POOL (2048) 个预分配的 rcSpan。
+	/// 新分配的池插入链表头部。析构时遍历此链表释放所有池。
+	rcSpanPool* pools;
+
+	/// 空闲 Span 链表的头指针（使用 rcSpan::next 串联）。
+	/// 分配新 Span 时从此链表头部取出；释放 Span 时归还到此链表头部。
+	/// 当 freelist 为 NULL 时，会分配新的 rcSpanPool 并将其中的 Span 加入空闲链表。
+	rcSpan* freelist;
 
 private:
-	// Explicitly-disabled copy constructor and copy assignment operator.
+	// 显式禁用拷贝构造函数 —— rcHeightfield 持有动态分配的资源（spans数组、内存池），
+	// 浅拷贝会导致双重释放等问题，因此禁止拷贝。
 	rcHeightfield(const rcHeightfield&);
+
+	// 显式禁用拷贝赋值运算符 —— 原因同上。
 	rcHeightfield& operator=(const rcHeightfield&);
 };
 
